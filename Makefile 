@@ -1,0 +1,118 @@
+####################################################################################
+# Company: ISAE
+# Engineer: Szymon Bogus
+# 
+# Create Date: 07.12.25
+# Design Name: 
+# Module Name: 
+# Project Name: drone_basys3
+# Target Devices: Basys 3
+# Tool Versions: 
+# Description: Makefile based build system using GHDL to simulate testbenches.
+#              Run: $ make <tb_name>
+# 
+# Dependencies: for .OUTPUT_SYNC: target make 4.0+ is required
+# 
+# Revision:
+# Revision 0.01 - File Created
+# Additional Comments: Refactored for Cross-Platform (Windows/Linux) compatibility
+# 
+####################################################################################
+
+# ================ OS DETECTION & COMMANDS ================
+ifeq ($(OS),Windows_NT)
+    # Windows (cmd.exe) commands
+    # Fix paths to use backslashes for native Windows commands
+    FIXPATH = $(subst /,\,$1)
+    # Windows mkdir creates intermediate dirs by default, but throws an error if it exists
+    MKDIR = if not exist "$(call FIXPATH,$1)" mkdir "$(call FIXPATH,$1)"
+    RMDIR = if exist "$(call FIXPATH,$1)" rmdir /S /Q "$(call FIXPATH,$1)"
+    RM = if exist "$(call FIXPATH,$1)" del /Q /F "$(call FIXPATH,$1)"
+    MOVE = move /Y "$(call FIXPATH,$1)" "$(call FIXPATH,$2)"
+    NULL_DEV = NUL
+    EXE_EXT = .exe
+else
+    # Linux/MacOS commands
+    FIXPATH = $1
+    MKDIR = mkdir -p $1
+    RMDIR = rm -rf $1
+    RM = rm -f $1
+    MOVE = mv $1 $2
+    NULL_DEV = /dev/null
+    EXE_EXT = 
+endif
+# =========================================================
+
+GHDL        := ghdl
+FLAGS       := --std=08
+
+BUILD_ROOT  := build
+SRC_DIR     := src/hdl
+SIM_DIR     := src/sim
+SIM_OUT_DIR := simulation
+LOG_DIR     := log
+
+ALL_SRCS := $(wildcard $(SRC_DIR)/*.vhd)
+
+# Exclude files here (those which don't work; without it Make will make GHDL include them and things will fail)
+# IGNORE_SRCS := \
+#     $(SRC_DIR)/display_controller.vhd \
+#     $(SRC_DIR)/screen_utils_pkg.vhd
+
+# SRCS := $(filter-out $(IGNORE_SRCS), $(ALL_SRCS))
+SRCS := $(ALL_SRCS)
+
+TBS_SRCS  := $(wildcard $(SIM_DIR)/*_tb.vhd)
+TBS_NAMES := $(basename $(notdir $(TBS_SRCS)))
+
+.PHONY: all clean help
+
+.OUTPUT_SYNC: target
+
+help:
+	@echo "Usage:"
+	@echo "  make <tb_name>     : Run specific TB"
+	@echo "  make -j<N> all     : Run all testbenches in parallel (N = num cores)"
+	@echo "  make clean         : Clean workspace"
+
+all: $(TBS_NAMES)
+
+%_tb:
+	@# 1. Define a private build dir for this specific job to avoid GHDL collisions
+	$(eval CURRENT_WORKDIR := $(BUILD_ROOT)/$@)
+
+	@echo "--- Starting $@ ---"
+
+	@$(call MKDIR,$(CURRENT_WORKDIR))
+	@$(call MKDIR,$(SIM_OUT_DIR)/$@)
+	@$(call MKDIR,$(LOG_DIR)/$@)
+
+	@# 2. Import Sources into private workdir
+	@echo "  [$@] Importing..."
+	@$(GHDL) -i --workdir=$(CURRENT_WORKDIR) $(FLAGS) $(SRCS) $(SIM_DIR)/$@.vhd
+
+	@# 3. Compile and Elaborate
+	@echo "  [$@] Compiling..."
+	@$(GHDL) -m --workdir=$(CURRENT_WORKDIR) $(FLAGS) $@ > $(LOG_DIR)/$@/build.log 2>&1
+
+	@# Move executable (Dash (-) ignores errors if the move fails or file doesn't exist)
+	@-$(call MOVE,$@$(EXE_EXT),$(SIM_OUT_DIR)/$@/) > $(NULL_DEV) 2>&1
+
+	@# 4. Run Simulation
+	@echo "  [$@] Simulating..."
+	@$(GHDL) -r --workdir=$(CURRENT_WORKDIR) $(FLAGS) $@ --vcd=$(SIM_OUT_DIR)/$@/$@.vcd >> $(LOG_DIR)/$@/simulation.log 2>&1
+
+	@echo "SUCCESS: $@ finished."
+
+
+#
+# ================ MISC ================
+#
+
+.PHONY: clean
+clean:
+	@echo "Cleaning..."
+	@$(call RMDIR,$(BUILD_ROOT))
+	@$(call RMDIR,$(SIM_OUT_DIR))
+	@$(call RMDIR,$(LOG_DIR))
+	@$(call RM,*.cf)
