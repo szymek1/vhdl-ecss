@@ -1,0 +1,115 @@
+=============================================================================
+# scripts/run_sim.tcl
+# -----------------------------------------------------------------------------
+# Runs a single QuestaSim simulation of one testbench. Invoked by the
+# Makefile via vsim -do. Products:
+#
+# * a structured assertion result file (PASS/FAIL records)
+# * a Unified Coverage Database (UCDB) (line/branch/cond/stmt/...)
+# * an optional WLF waveform (when SAVE_WAVES=1)
+#
+# The result file drives the pass/fail verdict â€” coverage data does NOT.
+# Coverage merging and threshold enforcement happen in separate Makefile
+# targets, so a low-coverage TB is still allowed to pass.
+#
+# Required variables (set by the Makefile before invoking `do`):
+# tb_name – testbench entity name (eg pwm_generator_tb)
+# req_class – requirement class (eg A, B, common)
+# report_dir â€” absolute path to build/reports/
+# wave_dir â€” absolute path to build/waves/
+# cov_dir – absolute path to build/coverage/
+#
+# These are set as TCL global variables by the calling Makefile recipe like:
+# vsim -do "set tb_name foo; set req_class A; ...; do run_sim.tcl" work.foo
+#
+# Why not argv? QuestaSim's `do` command does not pass positional arguments
+# to the script via $argv â€” instead, $argv contains QuestaSim's own
+# command-line arguments. Setting global variables before `do` is the
+# documented and reliable way to pass parameters into a do-script.
+#
+# Output files:
+# <report_dir>/<class>/<tb_name>.result
+# <cov_dir>/<class>/<tb_name>.ucdb
+# <wave_dir>/<class>/<tb_name>.wlf (only when SAVE_WAVES=1)
+#
+# ECSS compliance:
+# * No test logic in this script – only simulation control.
+# * Every run is identifiable by class + name + simulation timestamp.
+# * Timeout enforces a hard upper bound on runtime â€” no hung tests.
+# =============================================================================
+
+# â”€â”€ Verify all required parameters were set by the caller â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+foreach var {tb_name req_class report_dir wave_dir cov_dir} {
+    if {![info exists $var]} {
+        puts "ERROR: TCL variable '$var' is not set."
+        puts "run_sim.tcl must be invoked via the Makefile, which sets"
+        puts "tb_name, req_class, report_dir, wave_dir, cov_dir before"
+        puts "calling 'do run_sim.tcl'."
+        quit -code 1
+    }
+}
+
+set timestamp [clock format [clock seconds] -format "%Y-%m-%d_%H:%M:%S"]
+set result_file "$report_dir/$req_class/$tb_name.result"
+set ucdb_file "$cov_dir/$req_class/$tb_name.ucdb"
+
+# â”€â”€ Banner in transcript â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+echo "â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• "
+echo " Testbench: $tb_name"
+echo "Requirement cls: $req_class"
+echo "Started at: $timestamp"
+echo "Result file: $result_file"
+echo "UCDB file: $ucdb_file"
+echo "â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• "
+
+# â”€â”€ Launch simulation with enabled coverage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -coverage on the vsim command line activates collection for code already
+# instrumented at compile time (the +cover=... flag passed to vcom).
+# -GG_RESULT_FILE feeds the per-TB result file path into the testbench.
+vsim -t 1ns \
+     -voptargs=+acc \
+     -coverage \
+     -GG_RESULT_FILE=$result_file \
+     -GG_REQ_CLASS=$req_class \
+     -GG_TB_NAME=$tb_name \
+     work.$tb_name
+
+# â”€â”€ Optional waveform capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if {[info exists ::env(SAVE_WAVES)] && $::env(SAVE_WAVES) == "1"} {
+    set wlf_file "$wave_dir/$req_class/$tb_name.wlf"
+    echo "Saving waveforms to $wlf_file"
+    log-recursive /*
+    transcript file [file rootname $wlf_file].transcript
+}
+
+# â”€â”€ Run with hard timeout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Testbenches must self-terminate by stopping the simulator (assert
+# severity failure or std.env.stop). 1 s of simulated time is far more
+# than any unit test should need at 32,768 Hz sample rate.
+set timeout_ns 1000000000
+onerror {resume}
+run $timeout_ns ns
+
+# â”€â”€ Save coverage database BEFORE quitting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# `coverage save` flushes the in-memory coverage data to a UCDB file that
+# can be merged later with `vcover merge`. Failure here must not abort
+# the test run – coverage is supplementary information.
+echo "Saving database coverage to $ucdb_file"
+if {[catch {coverage save $ucdb_file} err]} {
+    echo "WARN: coverage save failed: $err"
+}
+
+# â”€â”€ Verify the testbench produced its result file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# A missing or empty result file is itself a failure. The Makefile catches
+# this case as well, but flagging it here makes the cause explicit.
+if {![file exists $result_file]} {
+    set fd [open $result_file w]
+    puts $fd "FAIL|$tb_name|$req_class|tb_did_not_produce_result|simtime_at_exit=[time]|started=$timestamp"
+    close $fd
+    echo "ERROR: testbench did not write result file â€” synthesized TIMEOUT verdict"
+}
+
+echo "â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• "
+echo "Simulation finished: $tb_name"
+echo "â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• "
+quit -code 0
