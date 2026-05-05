@@ -1,0 +1,230 @@
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.PHONY: check-headers
+check-headers:
+	@mkdir -p $(LOG_DIR)
+	@echo "â”€â”€ ECSS header compliance check â”€â”€"
+	@python3 $(HEADER_CHECK) \
+	    --sources $(SRC_DIR) \
+	    --testbenches $(REQ_TB_DIR) \
+	    --log $(LOG_DIR)/header_check.log \
+	    || (echo "FAIL: header check failed â€” see $(LOG_DIR)/header_check.log"; exit 1)
+	@echo "PASS: all files have compliant headers"
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Compilation
+# Uses vcom -autoorder to resolve VHDL dependencies automatically.
+# Packages are still compiled first to give vcom the type definitions
+# it needs before encountering downstream consumers.
+#
+# Coverage instrumentation rules:
+#   * Packages and RTL (src/)        compiled with $(COV_OPT)  â†’ instrumented
+#   * Testbenches (verification/)    compiled WITHOUT coverage â†’ not measured
+# This keeps coverage metrics meaningful â€” they reflect exercise of the RTL.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+$(WORK_DIR)/.compiled: check-headers $(ALL_RTL_SRCS) $(TB_FILES)
+	@mkdir -p $(WORK_DIR) $(LOG_DIR)
+	@echo "â”€â”€ Creating QuestaSim work library at $(WORK_DIR) â”€â”€"
+	@cd $(BUILD_DIR) && $(VLIB) work > /dev/null
+	@cd $(BUILD_DIR) && $(VMAP) work work > /dev/null
+	@echo "â”€â”€ Compiling RTL packages [coverage: $(COV_METRICS)] â”€â”€"
+	@cd $(BUILD_DIR) && $(VCOM) $(VCOM_RTL_FLAGS) -work work \
+	    $(PKG_SRCS) > $(LOG_DIR)/compile_pkg.log 2>&1 \
+	    || (cat $(LOG_DIR)/compile_pkg.log; exit 1)
+	@echo "â”€â”€ Compiling RTL design (autoorder) [coverage: $(COV_METRICS)] â”€â”€"
+	@cd $(BUILD_DIR) && $(VCOM) $(VCOM_RTL_FLAGS) -work work \
+	    $(HDL_SRCS) > $(LOG_DIR)/compile_hdl.log 2>&1 \
+	    || (cat $(LOG_DIR)/compile_hdl.log; exit 1)
+	@echo "â”€â”€ Compiling testbenches (autoorder) [no coverage] â”€â”€"
+	@cd $(BUILD_DIR) && $(VCOM) $(VCOM_TB_FLAGS) -work work \
+	    $(TB_FILES) > $(LOG_DIR)/compile_tb.log 2>&1 \
+	    || (cat $(LOG_DIR)/compile_tb.log; exit 1)
+	@touch $@
+	@echo "â”€â”€ Compilation OK â”€â”€"
+
+.PHONY: compile
+compile: $(WORK_DIR)/.compiled
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Per-testbench simulation rule
+# ----------------------------------------------------------------------------
+# A testbench named pwm_generator_tb in class A produces:
+#   build/reports/A/pwm_generator_tb.result      (structured assertion log)
+#   build/log/A/pwm_generator_tb.log             (full QuestaSim transcript)
+#   build/coverage/A/pwm_generator_tb.ucdb       (per-TB coverage database)
+#
+# The UCDB is captured by run_sim.tcl via `coverage save`. Coverage data
+# does NOT affect testbench pass/fail â€” only assertion records do.
+# ECSS-E-ST-20-40C Â§C.2.1 leaves coverage targets to the verification plan.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+# Recipe template â€” instantiated per class so the path is class-specific
+define SIM_TB_RULE
+$(REPORT_DIR)/$(1)/%.result: $(REQ_TB_DIR)/$(1)/%.vhd $(WORK_DIR)/.compiled
+	@mkdir -p $(REPORT_DIR)/$(1) $(LOG_DIR)/$(1) $(WAVE_DIR)/$(1) $(COV_DIR)/$(1)
+	@echo "â”€â”€ [$(1)] running $$*  â”€â”€"
+	@cd $(BUILD_DIR) && $(VSIM) $(VSIM_FLAGS) \
+	    -do "set tb_name $$*; set req_class $(1); set report_dir $(REPORT_DIR); set wave_dir $(WAVE_DIR); set cov_dir $(COV_DIR); do $(RUN_SIM_TCL)" \
+	    work.$$* \
+	    > $(LOG_DIR)/$(1)/$$*.log 2>&1; \
+	    sim_status=$$$$?; \
+	    if [ $$$$sim_status -ne 0 ]; then \
+	        echo "  FAIL: simulator exited with $$$$sim_status (see $(LOG_DIR)/$(1)/$$*.log)"; \
+	        exit $$$$sim_status; \
+	    fi
+	@if [ ! -f $$@ ]; then \
+	    echo "  FAIL: testbench did not produce a result file ($$@)"; \
+	    exit 1; \
+	fi
+	@if grep -q "^FAIL" $$@; then \
+	    echo "  FAIL: assertion failures (see $$@)"; \
+	    grep "^FAIL" $$@ | sed 's/^/    /'; \
+	    exit 1; \
+	fi
+	@if [ ! -f $(COV_DIR)/$(1)/$$*.ucdb ]; then \
+	    echo "  WARN: no coverage database produced (expected $(COV_DIR)/$(1)/$$*.ucdb)"; \
+	fi
+	@echo "  PASS"
+endef
+
+# Instantiate the rule once per requirement class
+$(foreach c,$(REQ_CLASSES),$(eval $(call SIM_TB_RULE,$(c))))
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Convenience aliases: sim-<tb_name>  â†’  build the corresponding result file
+# Each testbench gets its own alias regardless of which class it lives in.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.PHONY: $(addprefix sim-,$(TB_NAMES))
+$(foreach tb,$(TB_NAMES),$(eval \
+  sim-$(tb): $(REPORT_DIR)/$(TB_CLASS_$(tb))/$(tb).result))
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Per-class regression: sim-class-A, sim-class-B, ...
+#
+# Each class regression runs every TB in that class, then merges only the
+# UCDBs from that class into a per-class coverage report. This lets you see
+# how well a single class of tests covers the RTL on its own â€” useful for
+# identifying which RTL areas need more tests in a given class.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+define SIM_CLASS_RULE
+.PHONY: sim-class-$(1)
+sim-class-$(1): $(foreach tb,$(TBS_IN_CLASS_$(1)),$(REPORT_DIR)/$(1)/$(tb).result)
+	@$$(MAKE) --no-print-directory coverage-class-$(1)
+	@$$(MAKE) --no-print-directory report-$(1)
+
+endef
+$(foreach c,$(REQ_CLASSES),$(eval $(call SIM_CLASS_RULE,$(c))))
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Full regression
+# Runs every TB, merges all UCDBs, generates the global coverage report
+# and the global Markdown summary.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.PHONY: sim-all sim
+sim-all: $(foreach tb,$(TB_NAMES),$(REPORT_DIR)/$(TB_CLASS_$(tb))/$(tb).result)
+	@$(MAKE) --no-print-directory coverage
+	@$(MAKE) --no-print-directory report
+
+sim: sim-all
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Coverage merge & report
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Coverage targets are decoupled from sim targets so they can be re-run
+# without re-simulating. They consume whichever UCDB files happen to exist
+# in $(COV_DIR) at the moment they run.
+#
+# Coverage NEVER fails the build. The targets succeed even when coverage
+# is below any threshold â€” that policy is enforced at the verification-plan
+# level, not at the build level. ECSS-E-ST-20-40C Â§C.2.1 requires only that
+# the metrics are collected and reported.
+
+# Find all UCDBs currently on disk (evaluated lazily each invocation)
+ALL_UCDBS         = $(shell find $(COV_DIR) -name '*.ucdb' 2>/dev/null)
+
+.PHONY: coverage
+coverage:
+	@if [ -z "$(strip $(ALL_UCDBS))" ]; then \
+	    echo "â”€â”€ No UCDBs to merge â€” run a sim target first â”€â”€"; \
+	    exit 0; \
+	fi
+	@mkdir -p $(COV_DIR)
+	@echo "â”€â”€ Merging $$(echo $(ALL_UCDBS) | wc -w) coverage databases â”€â”€"
+	@$(VCOVER) merge -64 -out $(COV_MERGED) $(ALL_UCDBS) \
+	    > $(LOG_DIR)/coverage_merge.log 2>&1 \
+	    || (cat $(LOG_DIR)/coverage_merge.log; \
+	        echo "WARN: coverage merge failed â€” continuing without coverage"; \
+	        exit 0)
+	@echo "â”€â”€ Generating text coverage report â”€â”€"
+	@$(VCOVER) report -details -all -output $(COV_REPORT_TXT) $(COV_MERGED) \
+	    > $(LOG_DIR)/coverage_report.log 2>&1 \
+	    || (cat $(LOG_DIR)/coverage_report.log; exit 0)
+	@echo "â”€â”€ Generating HTML coverage report â”€â”€"
+	@$(VCOVER) report -html -htmldir $(COV_REPORT_HTML) -details $(COV_MERGED) \
+	    > $(LOG_DIR)/coverage_html.log 2>&1 \
+	    || (cat $(LOG_DIR)/coverage_html.log; exit 0)
+	@python3 $(PARSE_COVERAGE) \
+	    --txt-report $(COV_REPORT_TXT) \
+	    --output $(COV_DIR)/coverage_summary.md
+	@echo "â”€â”€ Coverage report at $(COV_DIR) â”€â”€"
+
+# Per-class coverage: merge only the UCDBs from one class
+define COV_CLASS_RULE
+.PHONY: coverage-class-$(1)
+coverage-class-$(1):
+	@if [ ! -d $(COV_DIR)/$(1) ] || [ -z "$$$$(ls $(COV_DIR)/$(1)/*.ucdb 2>/dev/null)" ]; then \
+	    echo "â”€â”€ No UCDBs for class $(1) â€” run sim-class-$(1) first â”€â”€"; \
+	    exit 0; \
+	fi
+	@mkdir -p $(COV_DIR)
+	@echo "â”€â”€ Merging coverage for class $(1) â”€â”€"
+	@$$(VCOVER) merge -64 -out $(COV_DIR)/merged_$(1).ucdb \
+	    $(COV_DIR)/$(1)/*.ucdb \
+	    > $(LOG_DIR)/coverage_merge_$(1).log 2>&1 \
+	    || (cat $(LOG_DIR)/coverage_merge_$(1).log; exit 0)
+	@$$(VCOVER) report -details -all \
+	    -output $(COV_DIR)/coverage_$(1).txt \
+	    $(COV_DIR)/merged_$(1).ucdb \
+	    > $(LOG_DIR)/coverage_report_$(1).log 2>&1 \
+	    || (cat $(LOG_DIR)/coverage_report_$(1).log; exit 0)
+	@python3 $$(PARSE_COVERAGE) \
+	    --txt-report $(COV_DIR)/coverage_$(1).txt \
+	    --output $(COV_DIR)/coverage_$(1)_summary.md
+	@echo "â”€â”€ Class $(1) coverage at $(COV_DIR)/coverage_$(1).txt â”€â”€"
+
+endef
+$(foreach c,$(REQ_CLASSES),$(eval $(call COV_CLASS_RULE,$(c))))
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Reporting
+# Aggregates per-TB results into a Markdown summary. When a coverage report
+# is available (coverage_summary.md or coverage_<class>_summary.md), it is
+# embedded into the corresponding requirements summary.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.PHONY: report
+report:
+	@python3 $(COLLECT_RESULTS) \
+	    --report-dir $(REPORT_DIR) \
+	    --coverage-md $(COV_DIR)/coverage_summary.md \
+	    --output $(REPORT_DIR)/summary.md
+
+# Per-class report: report-A, report-B, ...
+define REPORT_CLASS_RULE
+.PHONY: report-$(1)
+report-$(1):
+	@python3 $$(COLLECT_RESULTS) \
+	    --report-dir $$(REPORT_DIR) \
+	    --filter-class $(1) \
+	    --coverage-md $$(COV_DIR)/coverage_$(1)_summary.md \
+	    --output $$(REPORT_DIR)/summary_$(1).md
+
+endef
+$(foreach c,$(REQ_CLASSES),$(eval $(call REPORT_CLASS_RULE,$(c))))
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Maintenance
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+.PHONY: clean
+clean:
+	@echo "Removing build directory..."
+	@rm -rf $(BUILD_DIR)
+	@rm -f transcript modelsim.ini vsim.wlf *.vstf
