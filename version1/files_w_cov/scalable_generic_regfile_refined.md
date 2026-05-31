@@ -286,4 +286,105 @@ u_global_rf : entity work.generic_regfile(rtl)
 
 Passing the per-register policy as a record-array generic is the right pattern for this. The alternative — hardcoding the shadow/active and access logic per regfile type — would mean two different entities that drift apart and can't share verification. The generic-map approach keeps one entity, one architecture, one testbench, and pushes all the per-regfile variation into a data table that lives in a package. That table doubles as documentation: reading `C_MOTOR_POLICY` tells you exactly which registers are RO/WO/RW, which have shadows, and which commit groups exist. It's also what you'd generate from your register-map document if you later automate that.
 
+# Optimizing space for only a handful of shadow registers
+Exactly right — that's real waste, and you shouldn't count on the synthesizer to remove it. Let me explain why it won't, then give you two ways to fix it.
+
+## Why synthesis won't reliably optimize it away
+
+A synthesis tool removes a register only if it can prove the register has no effect on any output. Your `shadow_mem` array *does* affect outputs — the commit logic reads `shadow_mem(r)` and copies it to `active_mem`, which feeds `o_rd_data`. From the tool's static view, every element of `shadow_mem` is potentially read by the commit loop, because the loop indexes the whole array. The tool can't easily prove that `shadow_mem(31)` is never meaningfully used just because `G_POLICY(31).has_shadow` happens to be false — that's a value-dependent argument across a generic constant, and most tools won't carry that reasoning through an array-indexed loop.
+
+So in practice you get 35 shadow registers synthesized even when only 5 are ever written or committed. At 35 × 32 bits that's ~1100 wasted flip-flops per motor, ~4400 across four motors. Not catastrophic, but genuinely wasteful and worth eliminating since it's avoidable.
+
+## The cleaner fix: separate the shadow storage from the active storage by count
+
+The root issue is that `shadow_mem` is sized to `G_DEPTH` (all registers) when it only needs to be sized to the *number of shadowed registers*. The fix is to give shadow storage its own, smaller array, and map shadowed register indices into it.
+
+You precompute, at elaboration time (in the package, as a constant function), a mapping from "register index" to "shadow slot index" — or −1 if the register has no shadow. Then `shadow_mem` is sized to just the count of shadowed registers.
+
+```vhdl
+-- in the package: count how many registers have shadows, and build an
+-- index map from register index → shadow slot (or -1 if none).
+
+function count_shadows(policy : t_reg_policy_array) return natural is
+    variable n : natural := 0;
+begin
+    for i in policy'range loop
+        if policy(i).has_shadow then
+            n := n + 1;
+        end if;
+    end loop;
+    return n;
+end function;
+
+type t_shadow_map is array (natural range <>) of integer;
+
+function build_shadow_map(policy : t_reg_policy_array) return t_shadow_map is
+    variable map_arr : t_shadow_map(policy'range) := (others => -1);
+    variable slot    : natural := 0;
+begin
+    for i in policy'range loop
+        if policy(i).has_shadow then
+            map_arr(i) := slot;     -- register i uses shadow slot `slot`
+            slot := slot + 1;
+        end if;
+    end loop;
+    return map_arr;
+end function;
+```
+
+In the architecture, size the shadow memory to just the shadow count:
+
+```vhdl
+architecture rtl of generic_regfile is
+
+    constant C_N_SHADOW    : natural := count_shadows(G_POLICY);
+    constant C_SHADOW_MAP  : t_shadow_map(0 to G_DEPTH - 1) := build_shadow_map(G_POLICY);
+
+    type t_active_mem is array (0 to G_DEPTH - 1)
+        of std_logic_vector(G_BIT - 1 downto 0);
+    type t_shadow_mem is array (0 to C_N_SHADOW - 1)   -- ← only as big as needed
+        of std_logic_vector(G_BIT - 1 downto 0);
+
+    signal active_mem : t_active_mem := (others => (others => '0'));
+    signal shadow_mem : t_shadow_mem := (others => (others => '0'));
+    ...
+```
+
+Now `shadow_mem` has exactly 5 entries when 5 registers are shadowed, not 35. The write and commit logic index it through the map:
+
+```vhdl
+-- write to a shadowed register
+if G_POLICY(wr_idx).has_shadow then
+    shadow_mem(C_SHADOW_MAP(wr_idx)) <= i_wrt_data;   -- map to shadow slot
+else
+    active_mem(wr_idx) <= i_wrt_data;
+end if;
+
+-- commit: copy shadow slot to active for registers in the group
+for r in 0 to G_DEPTH - 1 loop
+    if G_POLICY(r).has_shadow
+    and G_POLICY(r).commit_group = G_POLICY(t).commit_group then
+        active_mem(r) <= shadow_mem(C_SHADOW_MAP(r));
+    end if;
+end loop;
+```
+
+The `C_SHADOW_MAP(wr_idx)` translates a register index into its compact shadow-slot index. Registers without shadows never touch `shadow_mem`, and `shadow_mem` is sized to the actual shadow count. The waste is gone — you allocate exactly the shadow storage the policy requires.
+
+## What this costs you
+
+The map indirection (`C_SHADOW_MAP(wr_idx)`) is resolved at elaboration into a small lookup — it's a constant array, so the synthesizer sees fixed index translations, not runtime computation. There's effectively no logic overhead, just the bookkeeping of the smaller array. The shadow flip-flops drop from `G_DEPTH × G_BIT` to `C_N_SHADOW × G_BIT`, which for your case is 5 × 32 = 160 flip-flops instead of 35 × 32 = 1120. That's the saving.
+
+## A simpler alternative if you'd rather not build the map
+
+If the elaboration-time function approach feels like too much machinery, there's a blunter option: keep `shadow_mem` the same size as active (`G_DEPTH`), but accept the waste only for the registers that actually need it by *not generating* shadow storage for the rest. This is harder to express cleanly in VHDL because array sizes are fixed — you can't make individual array elements conditionally exist. So the function-based compaction above is genuinely the cleaner route; the "just don't generate them" idea doesn't map well onto a VHDL array.
+
+The only simpler thing you could do is decide the waste is acceptable. For a single motor at ~1100 wasted flip-flops on an FPGA with 100,000+, it's about 1% of fabric. If you're not resource-constrained and you value the code simplicity, leaving the full-size shadow array is a defensible choice — it keeps the indexing trivial (`shadow_mem(wr_idx)` with no map). The decision is whether the ~1% fabric saving per motor is worth the map indirection. At four motors it's ~4% of a small FPGA, which might matter on a Microsemi part that's tighter than a big Xilinx one.
+
+## My recommendation
+
+Given you're targeting a Microsemi/Microchip part (which tends to have less fabric headroom than large Xilinx devices) and scaling to four motors, the compaction is worth doing — ~4400 flip-flops saved across four motors is meaningful on a smaller device. The elaboration-time `build_shadow_map` function is a one-time bit of package code, and once written it's invisible at the instantiation site. You define the policy table as before; the shadow compaction happens automatically based on how many `has_shadow => true` entries the policy contains.
+
+The principle generalizes: any time you have a generic structure where only a subset of elements need some expensive resource, precompute the subset at elaboration and size the resource to the subset, with an index map translating from the full index space to the compact one. It keeps the policy table readable (you still mark registers `has_shadow => true/false` naturally) while allocating hardware only for what's actually used.
+
 The one thing I'd watch as it grows is the synthesis cost of the commit loop. For 35 registers and a handful of commit groups it's fine. If you scale to many groups or much larger regfiles, precompute the group membership at elaboration to shrink the runtime logic. But get it working with the straightforward version first — premature optimisation here would just obscure the design.
