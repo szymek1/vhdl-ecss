@@ -110,3 +110,195 @@ CL_SIM_TIME ?= 500ms
 6. CSV logging + plot script; scale to N motors; long run.
 
 That ordering means every step lands on something already working, and by step 4 you have a genuinely closed loop with pass/fail — steps 5–6 turn it into measured functional coverage plus a debugging instrument.
+
+# model 
+Good refinement questions — all four touch real SystemC patterns. Let me address each design decision, then give you the comprehensive version.
+
+**Per-motor parameters.** `SC_MODULE` is a C++ class, so the constructor takes arguments after the mandatory module name. The idiomatic pattern for many parameters is a plain `struct` passed by const reference — one bundle per motor, defined in the VHDL-facing TB or a config header. Since you'll add a constructor with arguments, you need `SC_HAS_PROCESS` instead of `SC_CTOR` (that's the SystemC equivalent you're asking about).
+
+**Time step.** Don't hardcode `dt` and don't pass it as a number that can drift from reality — *derive it from the clock the module actually runs on*. Cleanest: pass the clock period as a constructor parameter (`sc_time`) and compute `dt = period.to_seconds()` once. Even better self-checking: on the second clock edge, measure `sc_time_stamp()` delta and assert it matches the configured dt — that catches a TB/clock mismatch instantly and permanently.
+
+**duty_to_volts.** Your PWM chain gives the plant a *switching* signal if you instantiate your VHDL `pwm_gen` (the plan from last time), or a *duty word* if you connect the core's duty registers directly. Two different converters: for a switching input, the phase voltage is simply `pin ? +U0 : −U0` (H-bridge, 27 V from Table 3.1) — no math, and Euler at 25 ns resolves the switching directly. For a duty-word input, it's the average `U0 * (2*duty/range − 1)` (signed around midscale, matching eq 5.11's PWM normalization). Support both with a mode flag so you can run fast smoke tests without the PWM entity and full-fidelity runs with it.
+
+**ADC as a separate module — yes, right instinct.** Injecting it as its own `SC_MODULE` (instantiated per phase, or one dual-channel) mirrors the real signal chain, keeps the plant purely physical, and lets you unit-test quantization/offset in isolation. Connect plant→ADC through `sc_signal<double>` — analog values crossing between SystemC modules is exactly what `sc_signal<double>` is for. Only the ADC touches `sc_lv`; only the ADC knows about bias and gain (the ~33-count structural offset the normalizer must cancel).
+
+**Logging** lives in the plant (it owns ground truth), decimated, CSV via `std::ofstream`, with commanded values fed in as side inputs so each row is *commanded vs. actual*.
+
+Here's the comprehensive design:
+
+```cpp
+// motor_plant.h ---------------------------------------------------------
+#include <systemc.h>
+#include <fstream>
+#include <string>
+#include <cmath>
+
+// ── Per-motor physical parameters (defaults = thesis Table 3.1) ───────
+struct motor_params {
+    double R      = 9.6;      // phase resistance [ohm]
+    double L      = 24e-3;    // phase inductance [H]
+    double U0     = 27.0;     // supply voltage [V]
+    double Ke     = 0.05;     // back-EMF constant [V·s/rad] (electrical)
+    double Kt     = 0.05;     // torque constant [N·m/A]
+    double J      = 1e-5;     // rotor+load inertia [kg·m²]
+    double B      = 1e-4;     // viscous friction [N·m·s/rad]
+    int    Np     = 50;       // pole pairs (th_e = Np * th_m)
+    // disturbances, eq 4.1: k0·sin(th_m+p0) + k1·sin(2·th_m+p1) + kr·sin(4·th_m+pr)
+    double k0=0, p0=0, k1=0, p1=0, kr=0, pr=0;
+};
+
+// ── ADC: separate module, owns quantization + structural offset ───────
+SC_MODULE(adc_model) {
+    sc_in<bool>        clk;
+    sc_in<double>      i_analog;      // current from plant [A]
+    sc_out<sc_lv<12>>  o_code;
+
+    double fullscale, gain;   // amps at full scale; gain error factor
+    int    bias;              // structural offset in counts (~33)
+
+    void sample() {
+        double lsb  = fullscale / 2048.0;                    // signed 12-bit
+        int    code = int(std::lround(i_analog.read()*gain/lsb)) + 2048 + bias;
+        if (code < 0) code = 0; if (code > 4095) code = 4095; // saturate
+        o_code.write(sc_lv<12>(sc_uint<12>(code)));
+    }
+    SC_HAS_PROCESS(adc_model);
+    adc_model(sc_module_name nm, double fs, int bias_counts, double gain_err)
+      : sc_module(nm), fullscale(fs), gain(gain_err), bias(bias_counts) {
+        SC_METHOD(sample); sensitive << clk.pos(); dont_initialize();
+    }
+};
+
+// ── Plant: pure physics, analog out, CSV logging ──────────────────────
+SC_MODULE(motor_plant) {
+    sc_in<bool>     clk;
+    sc_in<sc_logic> rst_n;
+
+    // drive input: either switching pins (mode SWITCHED) or duty words
+    sc_in<sc_logic> pwm_pin_a, pwm_pin_b;          // from your VHDL pwm_gen
+    sc_in<sc_lv<16>> duty_a, duty_b;               // direct-duty mode
+    sc_out<double>  ia_out, ib_out;                // analog, into adc_model
+
+    // commanded values (side inputs, logging only — wired from TB signals)
+    sc_in<sc_lv<32>> cmd_step;
+    sc_in<sc_lv<16>> cmd_frac;
+
+    enum drive_mode { SWITCHED, AVG_DUTY };
+
+    motor_params P;
+    drive_mode   mode;
+    double dt;                    // derived from clock period
+    int    motor_id;
+    unsigned decim, log_cnt = 0;
+    std::ofstream csv;
+
+    double ia=0, ib=0, th_m=0, om=0;
+    bool   dt_checked = false;
+    sc_time last_edge = SC_ZERO_TIME;
+
+    double volts(bool phase_b) {
+        if (mode == SWITCHED) {
+            sc_logic p = phase_b ? pwm_pin_b.read() : pwm_pin_a.read();
+            return (p == SC_LOGIC_1) ? P.U0 : -P.U0;          // H-bridge
+        } else {
+            unsigned d = (phase_b ? duty_b : duty_a).read().to_uint();
+            return P.U0 * (2.0*double(d)/65535.0 - 1.0);       // eq 5.11 avg
+        }
+    }
+
+    void step() {
+        // one-shot dt self-check against the actual clock
+        if (!dt_checked) {
+            if (last_edge != SC_ZERO_TIME) {
+                double meas = (sc_time_stamp()-last_edge).to_seconds();
+                sc_assert(std::abs(meas-dt) < 1e-12 && "dt != clock period");
+                dt_checked = true;
+            }
+            last_edge = sc_time_stamp();
+        }
+
+        if (rst_n.read() != SC_LOGIC_1) { ia=ib=th_m=om=0; }
+        else {
+            double the = P.Np * th_m;                          // electrical angle
+            // eq 2.3: electrical, with back-EMF
+            ia += dt/P.L * (volts(false) - P.R*ia + P.Ke*om*P.Np*std::sin(the));
+            ib += dt/P.L * (volts(true)  - P.R*ib - P.Ke*om*P.Np*std::cos(the));
+            // eq 2.4 torque from actual currents
+            double Te = P.Kt * (-ia*std::sin(the) + ib*std::cos(the));
+            // eq 4.1 disturbances
+            double Td = P.k0*std::sin(th_m+P.p0) + P.k1*std::sin(2*th_m+P.p1)
+                      + P.kr*std::sin(4*th_m+P.pr);
+            om   += dt/P.J * (Te + Td - P.B*om);
+            th_m += dt * om;
+        }
+        ia_out.write(ia); ib_out.write(ib);
+
+        if (++log_cnt >= decim) {
+            log_cnt = 0;
+            csv << sc_time_stamp().to_seconds() << ',' << motor_id << ','
+                << cmd_step.read().to_int() << ',' << cmd_frac.read().to_uint()
+                << ',' << th_m << ',' << om << ',' << ia << ',' << ib << '\n';
+        }
+    }
+
+    SC_HAS_PROCESS(motor_plant);
+    motor_plant(sc_module_name nm, const motor_params& p, int id,
+                sc_time clk_period, drive_mode m = SWITCHED,
+                unsigned decimation = 32,
+                const std::string& logdir = "build/closed_loop")
+      : sc_module(nm), P(p), mode(m),
+        dt(clk_period.to_seconds()), motor_id(id), decim(decimation),
+        csv(logdir + "/motor" + std::to_string(id) + ".csv") {
+        csv << "t,motor,cmd_step,cmd_frac,th_m,om,ia,ib\n";
+        SC_METHOD(step); sensitive << clk.pos(); dont_initialize();
+    }
+};
+```
+
+And a top-level SystemC wrapper per motor that bundles plant + two ADCs, so the VHDL side instantiates *one* component per motor with the clean digital interface:
+
+```cpp
+// motor_channel.h — what the VHDL actually instantiates ---------------
+SC_MODULE(motor_channel) {
+    sc_in<bool>       clk;
+    sc_in<sc_logic>   rst_n;
+    sc_in<sc_logic>   pwm_pin_a, pwm_pin_b;
+    sc_in<sc_lv<16>>  duty_a, duty_b;
+    sc_in<sc_lv<32>>  cmd_step;
+    sc_in<sc_lv<16>>  cmd_frac;
+    sc_out<sc_lv<12>> adc_a, adc_b;
+
+    sc_signal<double> ia_sig, ib_sig;             // analog plumbing
+    motor_plant plant;
+    adc_model   adc_ph_a, adc_ph_b;
+
+    SC_HAS_PROCESS(motor_channel);
+    motor_channel(sc_module_name nm, const motor_params& p, int id,
+                  sc_time period, motor_plant::drive_mode m,
+                  double adc_fs = 2.0, int adc_bias = 33, double adc_gain = 1.0)
+      : sc_module(nm),
+        plant("plant", p, id, period, m),
+        adc_ph_a("adc_a_m", adc_fs, adc_bias, adc_gain),
+        adc_ph_b("adc_b_m", adc_fs, adc_bias, adc_gain) {
+        plant.clk(clk); plant.rst_n(rst_n);
+        plant.pwm_pin_a(pwm_pin_a); plant.pwm_pin_b(pwm_pin_b);
+        plant.duty_a(duty_a); plant.duty_b(duty_b);
+        plant.cmd_step(cmd_step); plant.cmd_frac(cmd_frac);
+        plant.ia_out(ia_sig); plant.ib_out(ib_sig);
+        adc_ph_a.clk(clk); adc_ph_a.i_analog(ia_sig); adc_ph_a.o_code(adc_a);
+        adc_ph_b.clk(clk); adc_ph_b.i_analog(ib_sig); adc_ph_b.o_code(adc_b);
+    }
+};
+```
+
+Design notes on the choices baked in there:
+
+The **`motor_params` struct with thesis defaults** means motor 0 can be nominal while motor 1 gets `R = 10.2`, a torque-constant mismatch (via per-phase gain, which you can add as `Kta/Ktb` if you want to exercise the ga/gb correction path), and motor 2 gets disturbance amplitudes — three motors, three parameter sets, one line each in the TB config. That asymmetry is precisely what makes the multi-motor closed loop worth running: identical plants can't catch per-motor wiring or normalization bugs.
+
+The **dt self-check** converts "I passed the right clock period" from an assumption into an assertion — one-time cost, permanent protection, same philosophy as your WB-overrun assertion.
+
+The **two drive modes** let you keep one plant for both configurations: `AVG_DUTY` for fast functional runs wired straight to the core's duty registers (no PWM entity, coarser physics, much faster to converge tests), `SWITCHED` for the full-fidelity run with your VHDL `pwm_gen` in the chain contributing code coverage. Pick per-TB via constructor argument.
+
+The **ADC separation** puts fullscale/bias/gain in the one module whose job is signal conditioning. Your normalizer-verification vector (settle at zero → expect `yk ≈ 0` after cOff correction) now tests against a bias *you* injected in `adc_model`, and a second run with `adc_bias = 0` proves the correction is doing the work rather than masking a modeling accident.
+
+One caveat on the mixed-language boundary: Questa's SystemC↔VHDL binding is most robust with digital types at the boundary (`sc_logic`/`sc_lv` ↔ `std_logic`/`std_logic_vector`), which is why `motor_channel` is the unit VHDL instantiates — the `double` signals stay entirely inside the SystemC island. Register `motor_channel` for elaboration with `SC_MODULE_EXPORT` in the .cpp, and note that per-motor constructor parameters can't come through a VHDL generic map — the standard trick is a tiny SystemC top factory or reading a config table (id-indexed) inside the constructor; the id itself can come through as a plain integer parameter Questa passes via `sccom`-registered generics, or simplest of all, N `motor_channel` variants instantiated from a small SystemC wrapper that VHDL sees as one entity with a motor-count generic. Start with the config-table-indexed-by-id approach — it keeps the VHDL side to a plain component instantiation inside your existing generate loop.
