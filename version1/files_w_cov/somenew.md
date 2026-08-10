@@ -173,6 +173,7 @@ In **switched H-bridge mode**, replace ua, ub by the instantaneous ±Vsupply set
 
 1. **Backward-rotating field (direction/convention mismatch).** Your controller drives ib leading ia by 90°, while the plant torque law Te = Kt(−ia·sin θe + ib·cos θe) assumes ia = im·cos θe, ib = im·sin θe (ia leads). A quadrature swap reverses the sense of the current vector, so the mean lo
 
+"""python
 import argparse
 import pathlib
 import matplotlib.pyplot as plt
@@ -244,3 +245,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+"""
