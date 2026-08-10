@@ -172,3 +172,75 @@ In **switched H-bridge mode**, replace ua, ub by the instantaneous ±Vsupply set
 **Why ωm oscillates +25…−50 rad/s at the electrical frequency with a negative mean, and θm drifts to −0.23 rad:**
 
 1. **Backward-rotating field (direction/convention mismatch).** Your controller drives ib leading ia by 90°, while the plant torque law Te = Kt(−ia·sin θe + ib·cos θe) assumes ia = im·cos θe, ib = im·sin θe (ia leads). A quadrature swap reverses the sense of the current vector, so the mean lo
+
+import argparse
+import pathlib
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from scipy.fft import fft, fftfreq
+from scipy.signal import detrend, get_window
+
+
+def get_spectrum(t, y, linear_trend=False):
+    dt = float(np.mean(np.diff(t)))
+    y = detrend(y, type="linear" if linear_trend else "constant")
+    w = get_window("hann", len(y))
+    Y = fft(y * w)
+    f = fftfreq(len(y), d=dt)
+    m = f > 0
+    amp = np.abs(Y) * (4.0 / len(y))   # 2/N, x2 for Hann coherent gain
+    return f[m], amp[m]
+
+
+def get_data_fft(file_path, start_time=0.02):
+    df = pd.read_csv(file_path)
+    df.columns = df.columns.str.strip()
+    for col in ["t", "om"]:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    sel = df["t"] > start_time
+    t_sliced = df.loc[sel, "t"].to_numpy()
+    ang_vel = df.loc[sel, "om"].to_numpy()
+
+    return get_spectrum(t_sliced, ang_vel)
+
+
+def show_fft(ideal, dist):
+    f_i, A_i = ideal
+    f_d, A_d = dist
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.semilogy(f_i, A_i, color="blue", label="ideal motor")
+    ax.semilogy(f_d, A_d, color="red", alpha=0.75, label="disturbed motor")
+
+    for fx, lbl in [(200.0, "2·fe = 200 Hz"), (400.0, "detent 4·fe = 400 Hz")]:
+        ax.axvline(fx, ls="--", lw=0.8, color="gray")
+        ax.annotate(lbl, xy=(fx, 0.95), xycoords=("data", "axes fraction"),
+                    rotation=90, va="top", ha="right", fontsize=8, color="gray")
+
+    ax.set_xlim(20, 1000)
+    ax.set_xlabel("Hz")
+    ax.set_ylabel("Amplitude [rad/s]")
+    ax.set_title("Motor velocity frequency response")
+    ax.legend(loc="upper right")
+    ax.grid(True, which="both", alpha=0.3)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Display frequency response plots of motor velocity")
+    ap.add_argument("--ideal", required=True, type=pathlib.Path, help="path to ideal motor")
+    ap.add_argument("--dist", required=True, type=pathlib.Path, help="path to disturbed motor")
+    ap.add_argument("--t_start", required=True, type=float, help="Starting timestamp in seconds")
+    args = ap.parse_args()
+
+    ideal = get_data_fft(args.ideal, args.t_start)
+    dist = get_data_fft(args.dist, args.t_start)
+
+    show_fft(ideal, dist)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
